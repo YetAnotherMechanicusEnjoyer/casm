@@ -1,5 +1,5 @@
 [casm]
 name=casm repository
-baseurl=https://tsukini22.github.io/casm/rpm
+baseurl=https://yetanothermechanicusenjoyer.github.io/casm/rpm
 enabled=1
 gpgcheck=0
