@@ -1,7 +1,7 @@
 # casm
 
 <p align="center"> 
-  <img alt="AUR Version" src="https://img.shields.io/aur/version/wayra?style=for-the-badge&logo=archlinux&logoColor=white&label=casm-cli&labelColor=1793D1&link=https%3A%2F%2Faur.archlinux.org%2Fpackages%2Fcasm-cli">
+  <img alt="AUR Version" src="https://img.shields.io/aur/version/casm-cli?style=for-the-badge&logo=archlinux&logoColor=white&label=casm-cli&labelColor=1793D1&link=https%3A%2F%2Faur.archlinux.org%2Fpackages%2Fcasm-cli">
   <img alt="Nix Flake" src="https://img.shields.io/badge/casm-flake-5277C3?style=for-the-badge&logo=nixos&logoColor=white&labelColor=5277C3&link=https%3A%2F%2Fgithub.com%2FYetAnotherMechanicusEnjoyer%2Fcasm%2Fblob%2Fea7491a9dec1b0f5c0ec1b6a9a9cdc92171c2f87%2Fflake.nix">
 
 
