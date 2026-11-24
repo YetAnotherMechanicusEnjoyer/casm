@@ -17,3 +17,22 @@ Homepage: https://github.com/YetAnotherMechanicusEnjoyer/casm
 Description: A small build system for NASM projects
  casm assembles and links NASM projects from a build.casm file: init, build, run (under valgrind or strace) and clean.
 
+Package: casm
+Version: 0.0.0r17.gd042aac-1
+Architecture: all
+Maintainer: Frezzydy <frezzydygaming@gmail.com>
+Installed-Size: 80
+Depends: bash (>= 4.4), nasm, binutils, coreutils
+Recommends: gcc
+Suggests: valgrind, strace
+Filename: pool/main/casm_0.0.0r17.gd042aac-1_all.deb
+Size: 20428
+MD5sum: c121b3c72f688b24daa3ce72e45f8c6b
+SHA1: 7c998590b05e25ec8ae6e0a53618433f3a886e4e
+SHA256: 8ebeaa7cb1a03d2df8d4b6cb79122a5f79f560c14a9aa514804759913e05bf46
+Section: devel
+Priority: optional
+Homepage: https://github.com/YetAnotherMechanicusEnjoyer/casm
+Description: A small build system for NASM projects
+ casm assembles and links NASM projects from a build.casm file: init, build, run (under valgrind or strace) and clean.
+
