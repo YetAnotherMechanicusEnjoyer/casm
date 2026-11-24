@@ -1,0 +1,213 @@
+name: DEB Publisher
+
+run-name: DEB Publisher | ${{ github.event_name }} by ${{ github.actor }} on '${{ github.ref_name }}'
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    name: Building the DEB package
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    defaults:
+      run:
+        shell: bash
+
+    container:
+      image: ghcr.io/tsukini22/ci:latest # cmake (CPack), bsdtar
+
+    outputs:
+      version: ${{ steps.version_extract.outputs.VERSION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # tags and history of the version
+
+      - name: Extract Git Tag version
+        id: version_extract
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Same version as the AUR / Nix publishers
+          if git describe --tags &> /dev/null; then
+            VERSION=$(git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g')
+          else
+            COUNT=$(git rev-list --count HEAD)
+            HASH=$(git rev-parse --short=7 HEAD)
+            VERSION="0.0.0r${COUNT}.g${HASH}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "✓ version $VERSION"
+
+      - name: Build package (CPack)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCASM_VERSION="${{ steps.version_extract.outputs.VERSION }}"
+          cpack --config build/CPackConfig.cmake -G DEB -B build
+        timeout-minutes: 5
+
+      - name: Check package
+        run: |
+          set -euo pipefail
+          FILE="build/casm_${{ steps.version_extract.outputs.VERSION }}-1_all.deb"
+          if [ ! -f "$FILE" ]; then
+            echo "::error title=Missing package (DEB)::$FILE not found"
+            exit 1
+          fi
+
+          # Files of the package (data.tar.* of the .deb archive): the script and its license, like the PKGBUILD
+          DATA="$(bsdtar -tf "$FILE" | grep '^data\.tar')"
+          CONTENT="$(bsdtar -xOf "$FILE" "$DATA" | bsdtar -tf -)"
+          for path in ./usr/bin/casm ./usr/share/licenses/casm/LICENSE; do
+            if ! grep -qx "$path" <<< "$CONTENT"; then
+              echo "::error title=Package content (DEB)::$path missing in $(basename "$FILE")"
+              exit 1
+            fi
+          done
+          echo "✓ Package ok -> $(basename "$FILE")"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v6
+        with:
+          name: deb-package
+          path: build/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-deb:
+    name: Publishing to gh-pages (APT repository)
+    needs: build-deb
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    defaults:
+      run:
+        shell: bash
+
+    container:
+      image: ghcr.io/tsukini22/package:latest # dpkg-dev, apt-utils, git
+
+    concurrency:
+      group: gh-pages-deb-${{ github.repository }}
+      cancel-in-progress: false # one publication at a time, never cancel one
+
+    env:
+      VERSION: ${{ needs.build-deb.outputs.version }}
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v7
+        with:
+          name: deb-package
+          path: build
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          path: gh-pages
+          fetch-depth: 1
+
+      - name: Switch to gh-pages (created by the first publication)
+        working-directory: gh-pages
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/gh-pages"
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git checkout -B gh-pages FETCH_HEAD
+            echo "✓ gh-pages checked out"
+          else
+            git checkout --orphan gh-pages
+            git rm -rf --quiet .
+            git clean -fdxq
+            echo "✓ gh-pages created (orphan branch)"
+          fi
+
+      - name: Repository files (index)
+        run: |
+          set -euo pipefail
+          # Same files from the RPM Publisher: identical content, no conflict between the two publications
+          touch gh-pages/.nojekyll
+          cat > gh-pages/index.html <<EOF
+          <!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8"><title>casm packages</title>
+          <meta http-equiv="refresh" content="0; url=https://github.com/${GITHUB_REPOSITORY}#installation-deb--rpm">
+          </head><body><a href="https://github.com/${GITHUB_REPOSITORY}#installation-deb--rpm">casm installation</a></body></html>
+          EOF
+
+      - name: Sync files into gh-pages (DEB)
+        run: |
+          set -euo pipefail
+          POOL_DIR="gh-pages/debian/pool/main"
+          mkdir -p "$POOL_DIR"
+          mv build/*.deb "$POOL_DIR/"
+
+          # Keep every build of a tag (vX.Y.Z -> X.Y.Z.r0.g<hash>), only the 5 last versions of the other builds
+          find "$POOL_DIR" -maxdepth 1 -name 'casm_*_all.deb' ! -name '*.r0.g*' -printf '%f\n' \
+              | sort -V \
+              | head -n -5 \
+              | while read -r file; do echo "Prune old version: $file"; rm -f "${POOL_DIR:?}/${file:?}"; done
+
+      - name: Update metadata (DEB)
+        working-directory: gh-pages/debian
+        run: |
+          set -euo pipefail
+          # Architecture 'all': the same index for each architecture of the PKGBUILD (i686, x86_64, aarch64)
+          ARCHS="amd64 arm64 i386"
+          rm -rf dists/stable
+          for arch in $ARCHS; do
+            DIST_DIR="dists/stable/main/binary-$arch"
+            mkdir -p "$DIST_DIR"
+            dpkg-scanpackages --multiversion --arch "$arch" pool/main /dev/null > "$DIST_DIR/Packages"
+            gzip -k -f "$DIST_DIR/Packages"
+            xz -k -f "$DIST_DIR/Packages"
+          done
+
+          # Generate Release file
+          cat > dists/stable/Release <<EOF
+          Origin: ${GITHUB_REPOSITORY_OWNER}
+          Label: casm
+          Suite: stable
+          Codename: stable
+          Architectures: ${ARCHS}
+          Components: main
+          Description: casm APT repository
+          Date: $(date -Ru)
+          EOF
+
+          # Unsigned repository (no InRelease / Release.gpg): read by apt with 'deb [trusted=yes] ...' (setup.sh)
+          apt-ftparchive release dists/stable >> dists/stable/Release
+          echo "✓ APT repository: $(find pool/main -name '*.deb' | wc -l) package(s)"
+
+      - name: Commit and push
+        working-directory: gh-pages
+        run: |
+          set -euo pipefail
+          git config user.email "servoskull@omnissiah.mars"
+          git config user.name "Servo Skull"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          git commit -m "workflow: publish casm ${VERSION} (deb)"
+
+          # gh-pages can move meanwhile (RPM Publisher or manual push): rebase on it and retry
+          for attempt in 1 2 3 4 5; do
+            if git push origin gh-pages; then
+              echo "✓ casm ${VERSION} published (deb)"
+              exit 0
+            fi
+            echo "Push refused: rebase on the new gh-pages and retry ($attempt/5)..."
+            git pull --rebase origin gh-pages
+          done
+          echo "::error title=Push::gh-pages not pushed after 5 attempts"
+          exit 1
