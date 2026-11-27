@@ -19,8 +19,10 @@ FORMAT=elf64
 DEBUG=false
 NASM=${NASM:-nasm}
 LD=${LD:-ld}
+AR=${AR:-ar}
 CC=${CC:-gcc}
 LINK_DRIVER=ld
+BUILD_TYPE=executable
 
 COMMAND=build
 VERBOSE=false
@@ -34,6 +36,7 @@ CLI_FILE=false
 CLI_BUILD_DIR=
 CLI_OUTPUT=
 CLI_DEBUG=
+CLI_LIBRARY=false
 
 declare -a ASM_SOURCES=()
 declare -a SOURCE_DIRS=()
@@ -82,7 +85,8 @@ COMMANDS:
 
 OPTIONS:
   -f, --file PATH       Build file (default: build.casm).
-  -o, --output PATH     Override the executable path.
+  -o, --output PATH     Override the output path.
+      --lib              Build a static library (.a) instead of an executable.
       --build-dir PATH  Override the build directory.
       --debug           Include DWARF debug information.
       --no-debug        Disable debug information.
@@ -94,7 +98,13 @@ OPTIONS:
       --no-color        Disable colored output.
   -h, --help            Show this help.
 
-SOURCE CONFIGURATION (build.casm):
+CONFIGURATION (build.casm):
+  [build]
+  type = "staticlib"            Build a static archive instead of an executable.
+
+  [tools]
+  ar = "ar"                     Static library archiver.
+
   [sources]
   root = "src"                 Discover every .asm file recursively.
   root = "libasm"              Additional source directory.
@@ -105,6 +115,7 @@ SOURCE CONFIGURATION (build.casm):
 EXAMPLES:
   casm init
   casm build --debug
+  casm build --lib
   casm run -- arg1 "hello world"
   casm run --quiet | grep SUCCESS
   casm clean
@@ -189,6 +200,7 @@ render_step() {
   Linking) color=$C_BLUE ;;
   Cached) color=$C_GREEN ;;
   Assembling) color=$C_MAGENTA ;;
+  Archiving) color=$C_BLUE ;;
   esac
 
   if [[ "$ANIMATE" == true ]]; then
@@ -323,6 +335,14 @@ parse_value() {
       config_error "$line_number" "'build.debug' must be true or false."
     DEBUG=$value
     ;;
+  build.type)
+    mark_scalar "$token" "$line_number"
+    case "$value" in
+    executable) BUILD_TYPE=executable ;;
+    staticlib | static | library) BUILD_TYPE=staticlib ;;
+    *) config_error "$line_number" "'build.type' must be 'executable' or 'staticlib'." ;;
+    esac
+    ;;
   build.nasm_flag) NASM_FLAGS+=("$value") ;;
   build.link_flag) LINK_FLAGS+=("$value") ;;
   tools.nasm)
@@ -332,6 +352,10 @@ parse_value() {
   tools.ld)
     mark_scalar "$token" "$line_number"
     LD=$value
+    ;;
+  tools.ar)
+    mark_scalar "$token" "$line_number"
+    AR=$value
     ;;
   tools.cc)
     mark_scalar "$token" "$line_number"
@@ -429,6 +453,10 @@ parse_cli() {
       CLI_DEBUG=false
       shift
       ;;
+    --lib | --library)
+      CLI_LIBRARY=true
+      shift
+      ;;
     --force)
       FORCE=true
       INIT_FORCE=true
@@ -475,6 +503,10 @@ validate_cli_context() {
     usage_error '--valgrind, --strace and program arguments are only valid with run.'
   fi
 
+  if [[ "$CLI_LIBRARY" == true && "$COMMAND" != build ]]; then
+    usage_error '--lib is only valid with build.'
+  fi
+
   if [[ "$USE_VALGRIND" == true && "$USE_STRACE" == true ]]; then
     usage_error 'choose either --valgrind or --strace, not both.'
   fi
@@ -484,6 +516,7 @@ apply_cli_overrides() {
   [[ -n "$CLI_BUILD_DIR" ]] && BUILD_DIR=$CLI_BUILD_DIR
   [[ -n "$CLI_OUTPUT" ]] && OUTPUT=$CLI_OUTPUT
   [[ -n "$CLI_DEBUG" ]] && DEBUG=$CLI_DEBUG
+  [[ "$CLI_LIBRARY" == true ]] && BUILD_TYPE=staticlib
   ASM_SOURCES+=("${CLI_SOURCES[@]}")
 }
 
@@ -566,11 +599,29 @@ validate_config() {
     die "link.driver must be 'ld' or 'cc'."
   [[ "$DEBUG" == true || "$DEBUG" == false ]] ||
     die 'build.debug must be true or false.'
+  [[ "$BUILD_TYPE" == executable || "$BUILD_TYPE" == staticlib ]] ||
+    die "unsupported build type: '$BUILD_TYPE'."
+
+  if [[ "$COMMAND" == run && "$BUILD_TYPE" == staticlib ]]; then
+    die 'cannot run a static library; use `casm build` instead.'
+  fi
+
+  if [[ "$COMMAND" != clean && "$COMMAND" != clear &&
+    "$BUILD_TYPE" == staticlib &&
+    (${#LINK_INPUTS[@]} -gt 0 || ${#LINK_FLAGS[@]} -gt 0) ]]; then
+    die 'link.input and build.link_flag are not supported for static libraries.'
+  fi
   [[ -n "$BUILD_DIR" && "$BUILD_DIR" != / ]] ||
     die 'invalid build directory.'
   [[ -n "$PROJECT_NAME" ]] || die 'project.name cannot be empty.'
 
-  [[ -n "$OUTPUT" ]] || OUTPUT="${BUILD_DIR%/}/$PROJECT_NAME"
+  if [[ -z "$OUTPUT" ]]; then
+    if [[ "$BUILD_TYPE" == staticlib ]]; then
+      OUTPUT="${BUILD_DIR%/}/lib${PROJECT_NAME}.a"
+    else
+      OUTPUT="${BUILD_DIR%/}/$PROJECT_NAME"
+    fi
+  fi
 
   if [[ "$COMMAND" != clean && "$COMMAND" != clear ]]; then
     collect_sources
@@ -596,7 +647,6 @@ init_project() {
   local existing_root
   local include_dir
   local temporary
-  local output_path
   local build_dir_for_scan=${BUILD_DIR#./}
   local found_sources=0
   local has_root_file=false
@@ -613,7 +663,6 @@ init_project() {
   project_dir=${PWD%/}
   PROJECT_NAME=${project_dir##*/}
   [[ -n "$PROJECT_NAME" ]] || PROJECT_NAME=project
-  output_path=${OUTPUT:-${BUILD_DIR%/}/$PROJECT_NAME}
 
   build_dir_for_scan=${build_dir_for_scan%/}
   shopt -s globstar nullglob
@@ -663,14 +712,16 @@ init_project() {
     printf '# Generated by casm init. Edit this file to configure your project.\n\n'
     printf '[project]\n'
     printf 'name = %s\n' "$(quote_config_value "$PROJECT_NAME")"
-    printf 'output = %s\n\n' "$(quote_config_value "$output_path")"
+    printf '\n'
     printf '[build]\n'
     printf 'dir = %s\n' "$(quote_config_value "$BUILD_DIR")"
     printf 'format = "elf64"\n'
+    printf 'type = "executable"\n'
     printf 'debug = false\n\n'
     printf '[tools]\n'
     printf 'nasm = "nasm"\n'
     printf 'ld = "ld"\n'
+    printf 'ar = "ar"\n'
     printf 'cc = "gcc"\n\n'
     printf '[sources]\n'
 
@@ -948,7 +999,7 @@ link_objects() {
   local linker
   local input
   local output_dir
-  local metadata="${BUILD_DIR%/}/.link.cmd"
+  local metadata="${BUILD_DIR%/}/.output.cmd"
   local signature
   local needs_link=true
   local -a inputs=()
@@ -968,7 +1019,7 @@ link_objects() {
 
   command=("$linker" "${OBJECTS[@]}" "${inputs[@]}"
     "${LINK_FLAGS[@]}" -o "$OUTPUT")
-  signature=$(signature_of "${command[@]}")
+  signature=$(signature_of executable "${command[@]}")
 
   if [[ "$FORCE" != true && -f "$OUTPUT" && -f "$metadata" &&
     $(<"$metadata") == "$signature" ]]; then
@@ -998,31 +1049,90 @@ link_objects() {
   write_signature "$metadata" "$signature"
 }
 
+archive_objects() {
+  local input
+  local output_dir
+  local temporary="${OUTPUT}.tmp.${BASHPID}"
+  local metadata="${BUILD_DIR%/}/.output.cmd"
+  local signature
+  local needs_archive=true
+  local -a command=()
+
+  has_command "$AR" || die "cannot find archiver: '$AR'."
+  command=("$AR" rcs "$temporary" "${OBJECTS[@]}")
+  signature=$(signature_of staticlib "$AR" rcs "${OBJECTS[@]}")
+
+  if [[ "$FORCE" != true && -f "$OUTPUT" && -f "$metadata" &&
+    $(<"$metadata") == "$signature" ]]; then
+    needs_archive=false
+    for input in "${OBJECTS[@]}"; do
+      if [[ "$input" -nt "$OUTPUT" ]]; then
+        needs_archive=true
+        break
+      fi
+    done
+  fi
+
+  if [[ "$needs_archive" == false ]]; then
+    finish_step Cached "$OUTPUT"
+    return 0
+  fi
+
+  output_dir=${OUTPUT%/*}
+  [[ "$output_dir" != "$OUTPUT" ]] || output_dir=.
+  [[ -n "$output_dir" ]] || output_dir=/
+  mkdir -p -- "$output_dir"
+  rm -f -- "$temporary"
+
+  run_step Archiving "$OUTPUT" "${command[@]}" || {
+    rm -f -- "$temporary"
+    die 'creating static library failed.'
+  }
+  mv -f -- "$temporary" "$OUTPUT" || {
+    rm -f -- "$temporary"
+    die "cannot write library output: '$OUTPUT'."
+  }
+  write_signature "$metadata" "$signature"
+}
+
 build_project() {
   local mode=Release
+  local artifact=executable
 
   has_command "$NASM" || die "cannot find NASM: '$NASM'."
   has_command cksum || die 'required command not found: cksum.'
   [[ "$DEBUG" == true ]] && mode=Debug
+  [[ "$BUILD_TYPE" == staticlib ]] && artifact='static library'
 
   STEP_INDEX=0
   TOTAL_STEPS=$((${#ASM_SOURCES[@]} + 1))
 
-  ui "${C_CYAN}Building${C_RESET} ${C_BOLD}$PROJECT_NAME${C_RESET} ($mode)"
+  ui "${C_CYAN}Building${C_RESET} ${C_BOLD}$PROJECT_NAME${C_RESET} ($mode · $artifact)"
   if [[ "$VERBOSE" == true ]]; then
     print_detail "target: $FORMAT · $OUTPUT"
     print_detail "config: $BUILD_FILE · build directory: $BUILD_DIR"
-    print_detail "assembler: $NASM · linker: $LINK_DRIVER"
+    if [[ "$BUILD_TYPE" == staticlib ]]; then
+      print_detail "assembler: $NASM · archiver: $AR"
+    else
+      print_detail "assembler: $NASM · linker: $LINK_DRIVER"
+    fi
   fi
 
   build_objects
-  link_objects
+  if [[ "$BUILD_TYPE" == staticlib ]]; then
+    archive_objects
+  else
+    link_objects
+  fi
   clear_progress_line
   ui "${C_GREEN}Finished${C_RESET} '$PROJECT_NAME' ($mode)."
 }
 
 run_project() {
   local executable=$OUTPUT
+
+  [[ "$BUILD_TYPE" == executable ]] ||
+    die 'cannot run a static library; use `casm build` instead.'
 
   if [[ "$USE_VALGRIND" == true ]]; then
     has_command valgrind || die 'cannot find valgrind.'
